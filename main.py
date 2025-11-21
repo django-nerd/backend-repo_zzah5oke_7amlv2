@@ -1,8 +1,12 @@
 import os
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from typing import Any, Dict
 
-app = FastAPI()
+from database import db, create_document, get_documents
+
+app = FastAPI(title="Construction Lifecycle Platform API")
 
 app.add_middleware(
     CORSMiddleware,
@@ -14,7 +18,7 @@ app.add_middleware(
 
 @app.get("/")
 def read_root():
-    return {"message": "Hello from FastAPI Backend!"}
+    return {"message": "Construction Lifecycle Platform API is running"}
 
 @app.get("/api/hello")
 def hello():
@@ -31,39 +35,61 @@ def test_database():
         "connection_status": "Not Connected",
         "collections": []
     }
-    
+
     try:
-        # Try to import database module
-        from database import db
-        
         if db is not None:
             response["database"] = "✅ Available"
             response["database_url"] = "✅ Configured"
             response["database_name"] = db.name if hasattr(db, 'name') else "✅ Connected"
             response["connection_status"] = "Connected"
-            
-            # Try to list collections to verify connectivity
+
             try:
                 collections = db.list_collection_names()
-                response["collections"] = collections[:10]  # Show first 10 collections
+                response["collections"] = collections[:10]
                 response["database"] = "✅ Connected & Working"
             except Exception as e:
                 response["database"] = f"⚠️  Connected but Error: {str(e)[:50]}"
         else:
             response["database"] = "⚠️  Available but not initialized"
-            
-    except ImportError:
-        response["database"] = "❌ Database module not found (run enable-database first)"
+
     except Exception as e:
         response["database"] = f"❌ Error: {str(e)[:50]}"
-    
-    # Check environment variables
-    import os
+
     response["database_url"] = "✅ Set" if os.getenv("DATABASE_URL") else "❌ Not Set"
     response["database_name"] = "✅ Set" if os.getenv("DATABASE_NAME") else "❌ Not Set"
-    
+
     return response
 
+# Generic document creation endpoint for quick prototyping
+class GenericDoc(BaseModel):
+    collection: str
+    data: Dict[str, Any]
+
+@app.post("/api/create")
+def api_create(doc: GenericDoc):
+    if db is None:
+        raise HTTPException(status_code=500, detail="Database not configured")
+    try:
+        inserted_id = create_document(doc.collection, doc.data)
+        return {"id": inserted_id}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.get("/schema")
+def get_schema_index():
+    """Expose the Pydantic schema definitions to the frontend tooling/viewer."""
+    try:
+        import schemas as schema_module
+        exported = {}
+        for name, obj in schema_module.__dict__.items():
+            try:
+                if isinstance(obj, type) and issubclass(obj, BaseModel) and name not in {"BaseModel"}:
+                    exported[name] = obj.model_json_schema()
+            except Exception:
+                continue
+        return exported
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Schema export failed: {e}")
 
 if __name__ == "__main__":
     import uvicorn
