@@ -1,9 +1,9 @@
 INFO:     Will watch for changes in these directories: ['/home/workspace']
 INFO:     Uvicorn running on http://0.0.0.0:8000 (Press CTRL+C to quit)
-INFO:     Started reloader process [1064] using StatReload
+INFO:     Started reloader process [1108] using StatReload
 /home/workspace/database.py:25: UserWarning: You appear to be connected to a CosmosDB cluster. For more information regarding feature compatibility and support please visit https://www.mongodb.com/supportability/cosmosdb
   _client = MongoClient(database_url)
-INFO:     Started server process [1066]
+INFO:     Started server process [1110]
 INFO:     Waiting for application startup.
 INFO:     Application startup complete.
-INFO:     172.20.0.1:42558 - "HEAD / HTTP/1.1" 405 Method Not Allowed
+INFO:     172.20.0.1:43540 - "HEAD / HTTP/1.1" 405 Method Not Allowed
