@@ -2,13 +2,16 @@ import os
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException, Depends
+from fastapi import FastAPI, HTTPException, Depends, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 import jwt
 from passlib.context import CryptContext
 from pydantic import BaseModel, EmailStr
 from bson import ObjectId
+import hashlib
+from pymongo import ReturnDocument
+import gridfs
 
 from database import db, create_document, get_documents
 import schemas as schema_models
@@ -240,6 +243,10 @@ class CreateTask(BaseModel):
 
 @app.post("/api/tasks")
 async def create_task(payload: CreateTask, user: dict = Depends(get_current_user)):
+    # Validate project exists
+    proj = db["project"].find_one({"code": payload.project_code}) if db else None
+    if not proj:
+        raise HTTPException(status_code=400, detail="Invalid project_code")
     data = schema_models.Task(project_code=payload.project_code, title=payload.title, description=payload.description)
     new_id = create_document("task", data)
     return {"id": new_id}
@@ -260,6 +267,10 @@ class CreateRFI(BaseModel):
 
 @app.post("/api/rfis")
 async def create_rfi(payload: CreateRFI, user: dict = Depends(get_current_user)):
+    # Validate project exists
+    proj = db["project"].find_one({"code": payload.project_code}) if db else None
+    if not proj:
+        raise HTTPException(status_code=400, detail="Invalid project_code")
     data = schema_models.RFI(project_code=payload.project_code, subject=payload.subject, question=payload.question)
     new_id = create_document("rfi", data)
     return {"id": new_id}
@@ -298,6 +309,10 @@ class CreateDocument(BaseModel):
 
 @app.post("/api/documents")
 async def create_document_api(payload: CreateDocument, user: dict = Depends(get_current_user)):
+    # Validate project exists
+    proj = db["project"].find_one({"code": payload.project_code}) if db else None
+    if not proj:
+        raise HTTPException(status_code=400, detail="Invalid project_code")
     data = schema_models.Document(project_code=payload.project_code, title=payload.title, doc_type=payload.doc_type)
     new_id = create_document("document", data)
     return {"id": new_id}
@@ -308,6 +323,182 @@ async def list_documents(project_code: Optional[str] = None, limit: int = 50):
     filt = {"project_code": project_code} if project_code else None
     docs = get_documents("document", filter_dict=filt, limit=limit)
     return [serialize_doc(d) for d in docs]
+
+
+# ----------------------------
+# Attendance: Clock In / Clock Out (+ geolocation + project validation)
+# ----------------------------
+class ClockInRequest(BaseModel):
+    project_code: str
+    geo_in: Optional[dict] = None
+
+
+class ClockOutRequest(BaseModel):
+    project_code: Optional[str] = None
+    geo_out: Optional[dict] = None
+
+
+def _today_range():
+    now = datetime.now(timezone.utc)
+    start = datetime(year=now.year, month=now.month, day=now.day, tzinfo=timezone.utc)
+    end = start + timedelta(days=1)
+    return start, end
+
+
+@app.get("/api/attendance/today")
+async def get_attendance_today(user: dict = Depends(get_current_user)):
+    if db is None:
+        raise HTTPException(status_code=500, detail="Database not configured")
+    start, end = _today_range()
+    doc = db["attendance"].find_one({
+        "user_id": user["id"],
+        "date": {"$gte": start, "$lt": end}
+    })
+    return serialize_doc(doc) if doc else {"status": "absent"}
+
+
+@app.post("/api/attendance/clock-in")
+async def clock_in(payload: ClockInRequest, user: dict = Depends(get_current_user)):
+    if db is None:
+        raise HTTPException(status_code=500, detail="Database not configured")
+    # Validate project exists
+    proj = db["project"].find_one({"code": payload.project_code})
+    if not proj:
+        raise HTTPException(status_code=400, detail="Invalid project_code")
+
+    start, end = _today_range()
+    existing = db["attendance"].find_one({
+        "user_id": user["id"],
+        "date": {"$gte": start, "$lt": end}
+    })
+    now = datetime.now(timezone.utc)
+
+    if existing and existing.get("check_in"):
+        # Already clocked in today
+        return {"status": "already_clocked_in", "attendance": serialize_doc(existing)}
+
+    to_insert = schema_models.Attendance(
+        project_code=payload.project_code,
+        user_id=user["id"],
+        date=now,
+        check_in=now,
+        geo_in=payload.geo_in,
+    ).model_dump()
+
+    if existing:
+        # Record exists but without check_in (edge-case); update it
+        db["attendance"].find_one_and_update({"_id": existing["_id"]}, {"$set": {
+            "project_code": payload.project_code,
+            "check_in": now,
+            "geo_in": payload.geo_in,
+            "updated_at": now,
+        }}, return_document=ReturnDocument.AFTER)
+        doc = db["attendance"].find_one({"_id": existing["_id"]})
+        return {"status": "clocked_in", "attendance": serialize_doc(doc)}
+    else:
+        to_insert["created_at"] = now
+        to_insert["updated_at"] = now
+        res = db["attendance"].insert_one(to_insert)
+        to_insert["_id"] = res.inserted_id
+        return {"status": "clocked_in", "attendance": serialize_doc(to_insert)}
+
+
+@app.post("/api/attendance/clock-out")
+async def clock_out(payload: ClockOutRequest, user: dict = Depends(get_current_user)):
+    if db is None:
+        raise HTTPException(status_code=500, detail="Database not configured")
+    start, end = _today_range()
+    existing = db["attendance"].find_one({
+        "user_id": user["id"],
+        "date": {"$gte": start, "$lt": end}
+    })
+    if not existing or not existing.get("check_in"):
+        raise HTTPException(status_code=400, detail="No active attendance for today. Clock in first.")
+
+    if existing.get("check_out"):
+        return {"status": "already_clocked_out", "attendance": serialize_doc(existing)}
+
+    now = datetime.now(timezone.utc)
+    update = {
+        "$set": {
+            "check_out": now,
+            "geo_out": payload.geo_out,
+            "updated_at": now,
+        }
+    }
+    if payload.project_code:
+        # Validate provided project code
+        proj = db["project"].find_one({"code": payload.project_code})
+        if not proj:
+            raise HTTPException(status_code=400, detail="Invalid project_code")
+        update["$set"]["project_code"] = payload.project_code
+
+    db["attendance"].update_one({"_id": existing["_id"]}, update)
+    doc = db["attendance"].find_one({"_id": existing["_id"]})
+    return {"status": "clocked_out", "attendance": serialize_doc(doc)}
+
+
+# ----------------------------
+# File Uploads with checksum + audit logs
+# ----------------------------
+@app.post("/api/upload")
+async def upload_document(
+    project_code: str = Form(...),
+    title: str = Form(...),
+    doc_type: str = Form("other"),
+    change_note: Optional[str] = Form(None),
+    file: UploadFile = File(...),
+    user: dict = Depends(get_current_user)
+):
+    if db is None:
+        raise HTTPException(status_code=500, detail="Database not configured")
+    # Validate project exists
+    proj = db["project"].find_one({"code": project_code})
+    if not proj:
+        raise HTTPException(status_code=400, detail="Invalid project_code")
+
+    # Read file and compute checksum
+    content = await file.read()
+    checksum = hashlib.sha256(content).hexdigest()
+
+    # Store in GridFS
+    fs = gridfs.GridFS(db.client[db.name])
+    file_id = fs.put(content, filename=file.filename, content_type=file.content_type, checksum=checksum,
+                     uploaded_by=user.get("id"), project_code=project_code, title=title, doc_type=doc_type)
+
+    # Create Document record with version
+    version_label = "v1"
+    doc_model = schema_models.Document(
+        project_code=project_code,
+        title=title,
+        doc_type=doc_type,
+        versions=[schema_models.DocumentVersion(
+            version=version_label,
+            file_id=str(file_id),
+            checksum=checksum,
+            uploaded_by=user.get("id"),
+            change_note=change_note
+        )]
+    )
+    doc_id = create_document("document", doc_model)
+
+    # Audit Log
+    audit = schema_models.AuditLog(
+        project_code=project_code,
+        actor_id=user.get("id"),
+        action="upload",
+        entity_type="document",
+        entity_id=doc_id,
+        meta={
+            "filename": file.filename,
+            "checksum": checksum,
+            "doc_type": doc_type,
+            "version": version_label,
+        }
+    )
+    _ = create_document("auditlog", audit)
+
+    return {"id": doc_id, "checksum": checksum}
 
 
 # ----------------------------
