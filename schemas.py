@@ -32,6 +32,7 @@ class Role(BaseModel):
         "labourer",
         "auditor",
         "admin",
+        "client_executive",
     ]
     permissions: List[str] = Field(default_factory=list, description="List of permission codes")
 
@@ -41,6 +42,13 @@ class User(BaseModel):
     phone: Optional[str] = None
     role: str = Field(..., description="Role name that maps to Role collection")
     company: Optional[str] = None
+    is_active: bool = True
+
+class AuthUser(BaseModel):
+    full_name: str
+    email: EmailStr
+    role: str
+    hashed_password: str
     is_active: bool = True
 
 # ----------------------------
